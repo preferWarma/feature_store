@@ -1,0 +1,25 @@
+cmake_minimum_required(VERSION 3.15)
+project(feature_store)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# 1. 寻找依赖（vcpkg 会自动拦截并接管这里的查找逻辑）
+find_package(Arrow REQUIRED)
+find_package(RocksDB REQUIRED)
+
+# 2. 添加你的可执行文件
+add_executable(feature_store main.cpp)
+
+# 3. 链接库
+target_link_libraries(feature_store
+    PRIVATE
+    Arrow::arrow_static
+    RocksDB::rocksdb
+)
+
+target_include_directories(feature_store PRIVATE
+    ${PROJECT_SOURCE_DIR}/LogSystem
+)
+
+include(${PROJECT_SOURCE_DIR}/src/tests/CMakeLists.txt)

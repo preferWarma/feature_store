@@ -1,0 +1,24 @@
+[logger]
+level = "INFO"                    # 日志级别
+full_policy = "BLOCK"             # 背压策略
+time_format = "%Y-%m-%d %H:%M:%S" # 日志时间格式
+
+[logger.performance]
+worker_batch_size = 2048    # 工作线程批处理日志条数
+queue_capacity = 65536      # 日志队列容量
+queue_block_timeout_us = -1 # 队列阻塞超时时间，单位：微秒, -1 表示无限阻塞等待
+buffer_pool_size = 40960    # 全局日志缓冲区池大小
+tls_buffer_count = 64       # 每个线程本地日志缓冲区数量
+
+[sink.file]
+log_path = "logfile.log"  # 文件日志 sink 输出文件路径
+file_buffer_size_kb = 128 # 每个文件日志 sink 线程本地日志缓冲区大小
+rotate_policy = "NONE"    # 轮转策略: NONE(不轮转), DAILY(按日轮转), SIZE(按大小轮转)
+rotate_size_mb = 1024     # 按大小轮转时的文件大小阈值(MB)
+max_rotate_files = 7      # 最大保留轮转文件数
+
+[sink.console]
+console_buffer_size_kb = 16 # 每个控制台日志 sink 线程本地日志缓冲区大小
+
+[other]
+reload_interval_ms = 1000 # 配置文件热更新间隔，单位：毫秒

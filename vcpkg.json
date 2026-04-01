@@ -1,0 +1,9 @@
+{
+    "name": "feature-store",
+    "version": "1.0.0",
+    "dependencies": [
+        "arrow",
+        "rocksdb",
+        "gtest"
+    ]
+}
