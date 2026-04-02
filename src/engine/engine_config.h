@@ -24,6 +24,8 @@ struct EngineConfig {
     [[nodiscard]] arrow::Status Validate() const;
 
     static arrow::Result<EngineConfig> LoadFromJsonFile(std::string_view path);
+
+    [[nodiscard]] std::string ToString() const;
 };
 
 }  // namespace feature_store
