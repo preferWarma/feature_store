@@ -39,3 +39,15 @@ target_link_libraries(engine_config_test
 )
 
 add_test(NAME engine_config_test COMMAND engine_config_test)
+
+add_executable(schema_registry_test
+    ${PROJECT_SOURCE_DIR}/src/tests/schema_registry_test.cc
+)
+
+target_link_libraries(schema_registry_test
+    PRIVATE
+    feature_store_engine
+    GTest::gtest_main
+)
+
+add_test(NAME schema_registry_test COMMAND schema_registry_test)
