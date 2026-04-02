@@ -4,14 +4,24 @@ project(feature_store)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 1. 寻找依赖（vcpkg 会自动拦截并接管这里的查找逻辑）
+# 寻找依赖（vcpkg 会自动拦截并接管这里的查找逻辑）
 find_package(Arrow REQUIRED)
 find_package(RocksDB REQUIRED)
 
-# 2. 添加你的可执行文件
+# 启用 Address Sanitizer
+option(ENABLE_ASAN "Enable Address Sanitizer" OFF)
+if(ENABLE_ASAN)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
+    add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=address)
+    endif()
+endif()
+
+
+# 添加可执行文件
 add_executable(feature_store main.cpp)
 
-# 3. 链接库
+# 链接库
 target_link_libraries(feature_store
     PRIVATE
     Arrow::arrow_static
@@ -22,4 +32,6 @@ target_include_directories(feature_store PRIVATE
     ${PROJECT_SOURCE_DIR}/LogSystem
 )
 
+# 测试代码
 include(${PROJECT_SOURCE_DIR}/src/tests/CMakeLists.txt)
+include(${PROJECT_SOURCE_DIR}/src/tests/benchmark/CMakeLists.txt)
