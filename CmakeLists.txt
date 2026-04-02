@@ -24,11 +24,13 @@ add_executable(feature_store main.cpp)
 
 add_library(feature_store_engine
     src/engine/frame_codec.cc
+    src/engine/engine_config.cc
 )
 
 target_include_directories(feature_store_engine
     PUBLIC
     ${PROJECT_SOURCE_DIR}/src/engine
+    ${PROJECT_SOURCE_DIR}/LogSystem
 )
 
 target_link_libraries(feature_store_engine
