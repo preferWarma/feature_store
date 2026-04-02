@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # 寻找依赖（vcpkg 会自动拦截并接管这里的查找逻辑）
 find_package(Arrow REQUIRED)
 find_package(RocksDB REQUIRED)
+include(CTest)
 
 # 启用 Address Sanitizer
 option(ENABLE_ASAN "Enable Address Sanitizer" OFF)
@@ -21,9 +22,24 @@ endif()
 # 添加可执行文件
 add_executable(feature_store main.cpp)
 
+add_library(feature_store_engine
+    src/engine/frame_codec.cc
+)
+
+target_include_directories(feature_store_engine
+    PUBLIC
+    ${PROJECT_SOURCE_DIR}/src/engine
+)
+
+target_link_libraries(feature_store_engine
+    PUBLIC
+    Arrow::arrow_static
+)
+
 # 链接库
 target_link_libraries(feature_store
     PRIVATE
+    feature_store_engine
     Arrow::arrow_static
     RocksDB::rocksdb
 )
