@@ -27,6 +27,13 @@ struct BatchGetRequest {
   std::vector<std::string> columns;
 };
 
+struct BatchAppendRequest {
+  uint16_t table_id;
+  uint64_t uid;
+  uint16_t schema_version;
+  std::shared_ptr<arrow::RecordBatch> batch;
+};
+
 struct BatchGetResult {
   uint64_t uid;
   arrow::Status status;
@@ -55,6 +62,9 @@ public:
   arrow::Result<std::shared_ptr<arrow::RecordBatch>>
   GetFeature(uint16_t table_id, uint64_t uid, uint16_t target_version,
              const std::vector<std::string> &columns = {});
+
+  arrow::Status
+  BatchAppendFeature(const std::vector<BatchAppendRequest> &requests);
 
   std::vector<BatchGetResult>
   BatchGetFeature(const std::vector<BatchGetRequest> &requests);

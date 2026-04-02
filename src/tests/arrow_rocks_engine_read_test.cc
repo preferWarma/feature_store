@@ -129,6 +129,60 @@ TEST(ArrowRocksEngineReadTest, BatchGetAcrossTablesAndMissingKeys) {
     EXPECT_EQ(results[3].status.code(), arrow::StatusCode::KeyError);
 }
 
+TEST(ArrowRocksEngineReadTest, BatchAppendWritesMultipleKeysAcrossTables) {
+    ArrowRocksEngine engine;
+    EngineConfig cfg;
+    cfg.db_path = TempDBPath("feature_store_read_test_batch_append");
+    cfg.block_cache_size_mb = 64;
+    ASSERT_TRUE(engine.Init(cfg).ok());
+
+    ASSERT_TRUE(engine.RegisterSchema(1, 1, SchemaV1()).ok());
+    ASSERT_TRUE(engine.RegisterSchema(2, 1, SchemaV1()).ok());
+
+    std::vector<BatchAppendRequest> reqs{
+        {.table_id = 1, .uid = 11, .schema_version = 1, .batch = MakeV1Batch(11)},
+        {.table_id = 1, .uid = 12, .schema_version = 1, .batch = MakeV1Batch(12)},
+        {.table_id = 2, .uid = 21, .schema_version = 1, .batch = MakeV1Batch(21)},
+    };
+
+    ASSERT_TRUE(engine.BatchAppendFeature(reqs).ok());
+    ASSERT_TRUE(engine.FlushAll().ok());
+    ASSERT_TRUE(engine.CompactAll().ok());
+
+    auto r1 = engine.GetFeature(1, 11, 1);
+    auto r2 = engine.GetFeature(1, 12, 1);
+    auto r3 = engine.GetFeature(2, 21, 1);
+    ASSERT_TRUE(r1.ok());
+    ASSERT_TRUE(r2.ok());
+    ASSERT_TRUE(r3.ok());
+    EXPECT_EQ(std::static_pointer_cast<arrow::Int64Array>((*r1)->GetColumnByName("a"))->Value(0), 11);
+    EXPECT_EQ(std::static_pointer_cast<arrow::Int64Array>((*r2)->GetColumnByName("a"))->Value(0), 12);
+    EXPECT_EQ(std::static_pointer_cast<arrow::Int64Array>((*r3)->GetColumnByName("a"))->Value(0), 21);
+}
+
+TEST(ArrowRocksEngineReadTest, BatchAppendIsAtomicWhenRequestInvalid) {
+    ArrowRocksEngine engine;
+    EngineConfig cfg;
+    cfg.db_path = TempDBPath("feature_store_read_test_batch_append_atomic");
+    cfg.block_cache_size_mb = 64;
+    ASSERT_TRUE(engine.Init(cfg).ok());
+
+    ASSERT_TRUE(engine.RegisterSchema(1, 1, SchemaV1()).ok());
+
+    std::vector<BatchAppendRequest> reqs{
+        {.table_id = 1, .uid = 11, .schema_version = 1, .batch = MakeV1Batch(11)},
+        {.table_id = 2, .uid = 21, .schema_version = 1, .batch = MakeV1Batch(21)},
+    };
+
+    auto st = engine.BatchAppendFeature(reqs);
+    ASSERT_FALSE(st.ok());
+    EXPECT_EQ(st.code(), arrow::StatusCode::KeyError);
+
+    auto r1 = engine.GetFeature(1, 11, 1);
+    ASSERT_FALSE(r1.ok());
+    EXPECT_EQ(r1.status().code(), arrow::StatusCode::KeyError);
+}
+
 TEST(ArrowRocksEngineReadTest, ZeroCopyPinnableBufferIsReachableFromBatchBuffers) {
     EngineConfig cfg;
     cfg.db_path = TempDBPath("feature_store_read_test_zerocopy");

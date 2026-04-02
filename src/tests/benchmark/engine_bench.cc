@@ -233,6 +233,31 @@ static void BM_BatchGet(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations() * batch_size);
 }
 
+static void BM_BatchAppendFeature(benchmark::State &state) {
+  auto &ctx = AppendContext();
+  const int batch_size = static_cast<int>(state.range(0));
+  for (auto _ : state) {
+    std::vector<BatchAppendRequest> requests;
+    requests.reserve(static_cast<std::size_t>(batch_size));
+    for (int i = 0; i < batch_size; ++i) {
+      const uint64_t uid = ctx.next_uid.fetch_add(1, std::memory_order_relaxed);
+      requests.push_back(BatchAppendRequest{
+          .table_id = ctx.table_id,
+          .uid = uid,
+          .schema_version = ctx.version,
+          .batch = MakeBatch(ctx.schema, 8, static_cast<int64_t>(uid)),
+      });
+    }
+    auto st = ctx.engine.BatchAppendFeature(requests);
+    if (!st.ok()) {
+      state.SkipWithError(st.ToString().c_str());
+      break;
+    }
+    benchmark::DoNotOptimize(requests);
+  }
+  state.SetItemsProcessed(state.iterations() * batch_size);
+}
+
 static void BM_GetWithProjection(benchmark::State &state) {
   auto &ctx = ProjectionContext();
   const bool quarter = state.range(0) == 1;
@@ -299,6 +324,12 @@ static void BM_CRC32C(benchmark::State &state) {
 
 BENCHMARK(BM_AppendFeature)->UseRealTime();
 BENCHMARK(BM_AppendFeature)->Threads(4)->UseRealTime();
+BENCHMARK(BM_BatchAppendFeature)
+    ->Arg(1)
+    ->Arg(10)
+    ->Arg(100)
+    ->Arg(1000)
+    ->UseRealTime();
 
 BENCHMARK(BM_GetFeatureCacheHit);
 BENCHMARK(BM_GetFeatureCacheMiss);

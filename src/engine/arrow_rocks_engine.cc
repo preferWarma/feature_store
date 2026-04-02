@@ -150,9 +150,9 @@ FindLatestSchemaForArchive(const SchemaRegistry &registry, uint16_t table_id) {
   return arrow::Status::KeyError("schema not found");
 }
 
-arrow::Result<std::shared_ptr<arrow::RecordBatch>> AddArchiveMetadataColumns(
-    uint64_t uid, const Frame &frame,
-    const std::shared_ptr<arrow::RecordBatch> &batch) {
+arrow::Result<std::shared_ptr<arrow::RecordBatch>>
+AddArchiveMetadataColumns(uint64_t uid, const Frame &frame,
+                          const std::shared_ptr<arrow::RecordBatch> &batch) {
   arrow::UInt64Builder uid_builder;
   arrow::Int64Builder ts_builder;
   arrow::UInt16Builder ver_builder;
@@ -174,8 +174,8 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> AddArchiveMetadataColumns(
       arrow::field("__timestamp", arrow::int64(), false),
       arrow::field("__schema_version", arrow::uint16(), false),
   };
-  std::vector<std::shared_ptr<arrow::Array>> columns = {
-      uid_array, ts_array, ver_array};
+  std::vector<std::shared_ptr<arrow::Array>> columns = {uid_array, ts_array,
+                                                        ver_array};
 
   for (int i = 0; i < batch->num_columns(); ++i) {
     fields.push_back(batch->schema()->field(i));
@@ -481,6 +481,55 @@ ArrowRocksEngine::PutFeature(uint16_t table_id, uint64_t uid,
   return ToArrowStatus(s);
 }
 
+arrow::Status ArrowRocksEngine::BatchAppendFeature(
+    const std::vector<BatchAppendRequest> &requests) {
+  const auto start = std::chrono::steady_clock::now();
+  if (state_ != EngineState::kReady) {
+    return arrow::Status::Invalid("engine not ready");
+  }
+  if (!db_) {
+    return arrow::Status::Invalid("db not initialized");
+  }
+  if (requests.empty()) {
+    return arrow::Status::OK();
+  }
+
+  rocksdb::WriteBatch batch;
+  std::vector<std::pair<uint16_t, uint64_t>> metrics;
+  metrics.reserve(requests.size());
+  const auto base_ts = static_cast<int64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    const auto &req = requests[i];
+    if (!req.batch) {
+      return arrow::Status::Invalid("batch is null");
+    }
+    auto *cf = GetCF(req.table_id);
+    if (!cf) {
+      return arrow::Status::KeyError("table not found");
+    }
+    ARROW_ASSIGN_OR_RAISE(
+        auto frame, EncodeFrame(req.schema_version, base_ts + i, *req.batch));
+    batch.Merge(cf, EncodeKey(req.uid), frame);
+    metrics.emplace_back(req.table_id, static_cast<uint64_t>(frame.size()));
+  }
+
+  auto s = db_->Write(write_opts_, &batch);
+  const auto latency_us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - start)
+          .count());
+  if (s.ok()) {
+    for (const auto &[table_id, bytes] : metrics) {
+      Metrics::Global()->IncAppend(table_id, bytes, latency_us);
+    }
+  }
+  return ToArrowStatus(s);
+}
+
 arrow::Result<std::shared_ptr<arrow::RecordBatch>>
 ArrowRocksEngine::GetFeature(uint16_t table_id, uint64_t uid,
                              uint16_t target_version,
@@ -756,8 +805,8 @@ arrow::Status ArrowRocksEngine::ArchiveTable(uint16_t table_id,
   std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(ro, cf));
   for (it->SeekToFirst(); it->Valid(); it->Next()) {
     const auto key = it->key();
-    const uint64_t uid =
-        DecodeKey(std::string_view(key.data(), static_cast<std::size_t>(key.size())));
+    const uint64_t uid = DecodeKey(
+        std::string_view(key.data(), static_cast<std::size_t>(key.size())));
 
     const auto value = it->value();
     auto bytes = std::span<const uint8_t>(
@@ -798,7 +847,8 @@ arrow::Status ArrowRocksEngine::ArchiveTable(uint16_t table_id,
     std::error_code ec;
     std::filesystem::create_directories(parent_dir, ec);
     if (ec) {
-      return arrow::Status::IOError("failed to create archive dir: " + ec.message());
+      return arrow::Status::IOError("failed to create archive dir: " +
+                                    ec.message());
     }
   }
 
@@ -808,7 +858,8 @@ arrow::Status ArrowRocksEngine::ArchiveTable(uint16_t table_id,
       arrow::field("__schema_version", arrow::uint16(), false),
   });
   for (const auto &f : latest_schema->fields()) {
-    archive_schema = archive_schema->AddField(archive_schema->num_fields(), f).ValueOrDie();
+    archive_schema =
+        archive_schema->AddField(archive_schema->num_fields(), f).ValueOrDie();
   }
 
   std::shared_ptr<arrow::Table> table;
@@ -816,12 +867,15 @@ arrow::Status ArrowRocksEngine::ArchiveTable(uint16_t table_id,
     table = arrow::Table::Make(
         archive_schema, std::vector<std::shared_ptr<arrow::ChunkedArray>>{}, 0);
   } else {
-    ARROW_ASSIGN_OR_RAISE(table, arrow::Table::FromRecordBatches(archive_schema, batches));
+    ARROW_ASSIGN_OR_RAISE(
+        table, arrow::Table::FromRecordBatches(archive_schema, batches));
   }
 
-  ARROW_ASSIGN_OR_RAISE(auto sink, arrow::io::FileOutputStream::Open(archive_path));
-  ARROW_RETURN_NOT_OK(parquet::arrow::WriteTable(
-      *table, arrow::default_memory_pool(), sink, std::max<int64_t>(table->num_rows(), 1)));
+  ARROW_ASSIGN_OR_RAISE(auto sink,
+                        arrow::io::FileOutputStream::Open(archive_path));
+  ARROW_RETURN_NOT_OK(
+      parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink,
+                                 std::max<int64_t>(table->num_rows(), 1)));
   ARROW_RETURN_NOT_OK(sink->Close());
 
   return DropTable(table_id);
