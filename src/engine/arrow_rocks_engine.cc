@@ -182,61 +182,63 @@ arrow::Status ArrowRocksEngine::Init(const EngineConfig &config) {
       std::make_shared<ArrowTTLFilterFactory>(config.ttl_days * 86400000LL);
   options.compaction_filter_factory = ttl_filter_factory_;
 
-  cf_options_ = rocksdb::ColumnFamilyOptions(options);
-
   std::vector<std::string> cf_names;
   auto ls = rocksdb::DB::ListColumnFamilies(options, config.db_path, &cf_names);
-  if (!ls.ok()) {
-    cf_names = {rocksdb::kDefaultColumnFamilyName};
-  }
-
-  bool has_meta = false;
-  for (const auto &n : cf_names) {
-    if (n == "__meta__") {
-      has_meta = true;
-      break;
-    }
-  }
-  if (!has_meta) {
-    cf_names.push_back("__meta__");
-  }
-
-  std::vector<rocksdb::ColumnFamilyDescriptor> descs;
-  descs.reserve(cf_names.size());
-  for (const auto &n : cf_names) {
-    descs.emplace_back(n, cf_options_);
-  }
-
   rocksdb::DB *raw_db = nullptr;
-  std::vector<rocksdb::ColumnFamilyHandle *> handles;
-  auto s = rocksdb::DB::Open(options, config.db_path, descs, &handles, &raw_db);
-  ARROW_RETURN_NOT_OK(ToArrowStatus(s));
-  db_.reset(raw_db);
-
   default_cf_ = nullptr;
   meta_cf_ = nullptr;
   cf_handles_.clear();
-  for (std::size_t i = 0; i < handles.size(); ++i) {
-    if (descs[i].name == rocksdb::kDefaultColumnFamilyName) {
-      default_cf_ = handles[i];
-    } else if (descs[i].name == "__meta__") {
-      meta_cf_ = handles[i];
-    } else if (descs[i].name.rfind("t_", 0) == 0) {
-      unsigned int tid = 0;
-      if (std::sscanf(descs[i].name.c_str(), "t_%u", &tid) == 1 &&
-          tid <= 65535U) {
-        cf_handles_.emplace(static_cast<uint16_t>(tid), handles[i]);
+
+  rocksdb::Status s;
+  if (!ls.ok()) {
+    s = rocksdb::DB::Open(options, config.db_path, &raw_db);
+    ARROW_RETURN_NOT_OK(ToArrowStatus(s));
+    db_.reset(raw_db);
+  } else {
+    bool has_meta = false;
+    for (const auto &n : cf_names) {
+      if (n == "__meta__") {
+        has_meta = true;
+        break;
+      }
+    }
+    if (!has_meta) {
+      cf_names.push_back("__meta__");
+    }
+
+    std::vector<rocksdb::ColumnFamilyDescriptor> descs;
+    descs.reserve(cf_names.size());
+    for (const auto &n : cf_names) {
+      descs.emplace_back(n, MakeCFOptions());
+    }
+
+    std::vector<rocksdb::ColumnFamilyHandle *> handles;
+    s = rocksdb::DB::Open(options, config.db_path, descs, &handles, &raw_db);
+    ARROW_RETURN_NOT_OK(ToArrowStatus(s));
+    db_.reset(raw_db);
+
+    for (std::size_t i = 0; i < handles.size(); ++i) {
+      if (descs[i].name == rocksdb::kDefaultColumnFamilyName) {
+        default_cf_ = handles[i];
+      } else if (descs[i].name == "__meta__") {
+        meta_cf_ = handles[i];
+      } else if (descs[i].name.rfind("t_", 0) == 0) {
+        unsigned int tid = 0;
+        if (std::sscanf(descs[i].name.c_str(), "t_%u", &tid) == 1 &&
+            tid <= 65535U) {
+          cf_handles_.emplace(static_cast<uint16_t>(tid), handles[i]);
+        } else {
+          db_->DestroyColumnFamilyHandle(handles[i]);
+        }
       } else {
         db_->DestroyColumnFamilyHandle(handles[i]);
       }
-    } else {
-      db_->DestroyColumnFamilyHandle(handles[i]);
     }
   }
 
   if (!meta_cf_) {
     rocksdb::ColumnFamilyHandle *h = nullptr;
-    s = db_->CreateColumnFamily(cf_options_, "__meta__", &h);
+    s = db_->CreateColumnFamily(MakeCFOptions(), "__meta__", &h);
     ARROW_RETURN_NOT_OK(ToArrowStatus(s));
     meta_cf_ = h;
   }
@@ -279,6 +281,19 @@ std::string ArrowRocksEngine::CFName(uint16_t table_id) const {
   return std::string(buf);
 }
 
+rocksdb::ColumnFamilyOptions ArrowRocksEngine::MakeCFOptions() const {
+  rocksdb::ColumnFamilyOptions opts;
+  opts.write_buffer_size = config_.write_buffer_size;
+  opts.merge_operator = merge_operator_;
+  opts.compaction_filter_factory = ttl_filter_factory_;
+
+  rocksdb::BlockBasedTableOptions table_opts;
+  table_opts.block_cache =
+      rocksdb::NewLRUCache(config_.block_cache_size_mb * 1024ULL * 1024ULL);
+  opts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_opts));
+  return opts;
+}
+
 rocksdb::ColumnFamilyHandle *ArrowRocksEngine::GetCF(uint16_t table_id) const {
   auto it = cf_handles_.find(table_id);
   if (it == cf_handles_.end()) {
@@ -299,7 +314,7 @@ arrow::Status ArrowRocksEngine::EnsureCF(uint16_t table_id) {
     return arrow::Status::Invalid("db not initialized");
   }
   rocksdb::ColumnFamilyHandle *h = nullptr;
-  auto s = db_->CreateColumnFamily(cf_options_, CFName(table_id), &h);
+  auto s = db_->CreateColumnFamily(MakeCFOptions(), CFName(table_id), &h);
   ARROW_RETURN_NOT_OK(ToArrowStatus(s));
   cf_handles_.emplace(table_id, h);
   active_cf_count_.fetch_add(1, std::memory_order_relaxed);

@@ -84,6 +84,7 @@ private:
 
   arrow::Status EnsureReady() const;
   std::string CFName(uint16_t table_id) const;
+  rocksdb::ColumnFamilyOptions MakeCFOptions() const;
   rocksdb::ColumnFamilyHandle *GetCF(uint16_t table_id) const;
   arrow::Status EnsureCF(uint16_t table_id);
   arrow::Status CleanupOrphanCFs();
@@ -93,8 +94,6 @@ private:
 
   std::shared_ptr<rocksdb::MergeOperator> merge_operator_;
   std::shared_ptr<rocksdb::CompactionFilterFactory> ttl_filter_factory_;
-
-  rocksdb::ColumnFamilyOptions cf_options_;
 
   std::unique_ptr<rocksdb::DB> db_;
   rocksdb::ColumnFamilyHandle *default_cf_ = nullptr;

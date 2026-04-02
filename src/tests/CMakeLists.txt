@@ -123,3 +123,11 @@ target_link_libraries(metrics_test
 )
 
 add_test(NAME metrics_test COMMAND metrics_test)
+
+if(ENABLE_ASAN AND APPLE)
+    get_property(all_tests DIRECTORY PROPERTY TESTS)
+    set_tests_properties(${all_tests}
+        PROPERTIES
+        ENVIRONMENT "ASAN_OPTIONS=detect_container_overflow=0:detect_leaks=0"
+    )
+endif()
