@@ -20,6 +20,10 @@ public:
                            rocksdb::DB* db,
                            rocksdb::ColumnFamilyHandle* meta_cf);
 
+    arrow::Status RegisterInMemory(uint16_t table_id,
+                                   uint16_t version,
+                                   std::shared_ptr<arrow::Schema> schema);
+
     arrow::Status Unregister(uint16_t table_id);
 
     std::shared_ptr<arrow::Schema> Get(uint16_t table_id, uint16_t version) const;

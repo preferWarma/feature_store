@@ -141,6 +141,22 @@ arrow::Status SchemaRegistry::Register(uint16_t table_id,
         return arrow::Status::Invalid("db/meta_cf is null");
     }
 
+    ARROW_ASSIGN_OR_RAISE(auto serialized, SerializeSchemaToBytes(*schema));
+    const auto key = MakeSchemaKey(table_id, version);
+    rocksdb::WriteOptions wopts;
+    const rocksdb::Status s = db->Put(wopts, meta_cf, rocksdb::Slice(key), rocksdb::Slice(serialized));
+    ARROW_RETURN_NOT_OK(ToArrowStatus(s));
+
+    return RegisterInMemory(table_id, version, std::move(schema));
+}
+
+arrow::Status SchemaRegistry::RegisterInMemory(uint16_t table_id,
+                                               uint16_t version,
+                                               std::shared_ptr<arrow::Schema> schema) {
+    if (schema == nullptr) {
+        return arrow::Status::Invalid("schema is null");
+    }
+
     std::unique_lock lock(mu_);
 
     const uint32_t encoded_key = EncodeKey(table_id, version);
@@ -148,23 +164,15 @@ arrow::Status SchemaRegistry::Register(uint16_t table_id,
         return arrow::Status::Invalid("schema already registered");
     }
 
-    uint16_t base_version = 0;
-    std::shared_ptr<arrow::Schema> base_schema;
     auto max_version_res = FindMaxVersionForTable(table_id, schemas_);
     if (max_version_res.ok()) {
-        base_version = *max_version_res;
-        base_schema = schemas_.at(EncodeKey(table_id, base_version));
+        const uint16_t base_version = *max_version_res;
+        const auto base_schema = schemas_.at(EncodeKey(table_id, base_version));
         if (version <= base_version) {
             return arrow::Status::Invalid("schema version must be greater than existing max");
         }
         ARROW_RETURN_NOT_OK(ValidateSupersetSchema(*base_schema, *schema));
     }
-
-    ARROW_ASSIGN_OR_RAISE(auto serialized, SerializeSchemaToBytes(*schema));
-    const auto key = MakeSchemaKey(table_id, version);
-    rocksdb::WriteOptions wopts;
-    const rocksdb::Status s = db->Put(wopts, meta_cf, rocksdb::Slice(key), rocksdb::Slice(serialized));
-    ARROW_RETURN_NOT_OK(ToArrowStatus(s));
 
     schemas_.emplace(encoded_key, std::move(schema));
     return arrow::Status::OK();

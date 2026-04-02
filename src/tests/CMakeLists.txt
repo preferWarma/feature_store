@@ -99,3 +99,15 @@ target_link_libraries(arrow_rocks_engine_read_test
 )
 
 add_test(NAME arrow_rocks_engine_read_test COMMAND arrow_rocks_engine_read_test)
+
+add_executable(arrow_rocks_engine_lifecycle_test
+    ${PROJECT_SOURCE_DIR}/src/tests/arrow_rocks_engine_lifecycle_test.cc
+)
+
+target_link_libraries(arrow_rocks_engine_lifecycle_test
+    PRIVATE
+    feature_store_engine
+    GTest::gtest_main
+)
+
+add_test(NAME arrow_rocks_engine_lifecycle_test COMMAND arrow_rocks_engine_lifecycle_test)
