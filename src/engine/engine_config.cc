@@ -100,6 +100,12 @@ EngineConfig::LoadFromJsonFile(std::string_view path) {
     if (j.contains("disable_wal")) {
       cfg.disable_wal = j.at("disable_wal").get<bool>();
     }
+    if (j.contains("use_direct_reads")) {
+      cfg.use_direct_reads = j.at("use_direct_reads").get<bool>();
+    }
+    if (j.contains("fill_cache_on_read")) {
+      cfg.fill_cache_on_read = j.at("fill_cache_on_read").get<bool>();
+    }
     if (j.contains("block_cache_size_mb")) {
       ARROW_ASSIGN_OR_RAISE(
           cfg.block_cache_size_mb,
@@ -156,6 +162,8 @@ std::string EngineConfig::ToString() const {
   nlohmann::json j;
   j["db_path"] = db_path;
   j["disable_wal"] = disable_wal;
+  j["use_direct_reads"] = use_direct_reads;
+  j["fill_cache_on_read"] = fill_cache_on_read;
   j["block_cache_size_mb"] = block_cache_size_mb;
   j["ttl_days"] = ttl_days;
   j["enable_mmap_reads"] = enable_mmap_reads;

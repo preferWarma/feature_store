@@ -312,6 +312,7 @@ arrow::Status ArrowRocksEngine::Init(const EngineConfig &config) {
   state_ = EngineState::kNotReady;
   config_ = config;
   write_opts_.disableWAL = config.disable_wal;
+  read_opts_.fill_cache = config.fill_cache_on_read;
 
   rocksdb::Options options;
   options.create_if_missing = true;
@@ -321,6 +322,7 @@ arrow::Status ArrowRocksEngine::Init(const EngineConfig &config) {
   options.max_background_flushes = config.max_background_flushes;
   options.write_buffer_size = static_cast<size_t>(config.write_buffer_size);
   options.allow_mmap_reads = config.enable_mmap_reads;
+  options.use_direct_reads = config.use_direct_reads;
   if (config.enable_mmap_reads && IsRunningInCgroup()) {
     std::fprintf(stderr, "WARNING: enable_mmap_reads=true under cgroup may "
                          "increase RSS accounting\n");

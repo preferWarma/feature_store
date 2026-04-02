@@ -12,10 +12,12 @@ namespace feature_store {
 
 struct EngineConfig {
   std::string db_path;
-  bool disable_wal = false;
+  bool disable_wal = false;       // disable wal
+  bool use_direct_reads = false;  // direct io on read
+  bool fill_cache_on_read = true; // fill block cache on read
+  bool enable_mmap_reads = false; // enable mmap reads
   std::size_t block_cache_size_mb = 512;
   int64_t ttl_days = 3;
-  bool enable_mmap_reads = false;
   uint32_t max_column_families = 1024;
   uint16_t max_active_versions_per_table = 16;
   int max_background_compactions = 4;

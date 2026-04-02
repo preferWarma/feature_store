@@ -78,7 +78,9 @@ struct EngineBenchContext {
 
   EngineBenchContext(const std::string &name, int num_columns,
                      int64_t preload_keys, int64_t rows_per_batch,
-                     std::size_t cache_mb) {
+                     std::size_t cache_mb, bool flush_compact = true,
+                     bool use_direct_reads = false,
+                     bool fill_cache_on_read = true) {
     schema = MakeSchema(num_columns);
     for (int i = 0; i < std::max(1, num_columns / 4); ++i) {
       quarter_columns.push_back("c" + std::to_string(i));
@@ -88,6 +90,8 @@ struct EngineBenchContext {
     cfg.db_path = TempPath(name);
     cfg.block_cache_size_mb = cache_mb;
     cfg.disable_wal = true;
+    cfg.use_direct_reads = use_direct_reads;
+    cfg.fill_cache_on_read = fill_cache_on_read;
     cfg.ttl_days = 30;
     auto st = engine.Init(cfg);
     if (!st.ok()) {
@@ -107,13 +111,15 @@ struct EngineBenchContext {
       }
       uids.push_back(uid);
     }
-    st = engine.FlushAll();
-    if (!st.ok()) {
-      throw std::runtime_error(st.ToString());
-    }
-    st = engine.CompactAll();
-    if (!st.ok()) {
-      throw std::runtime_error(st.ToString());
+    if (flush_compact) {
+      st = engine.FlushAll();
+      if (!st.ok()) {
+        throw std::runtime_error(st.ToString());
+      }
+      st = engine.CompactAll();
+      if (!st.ok()) {
+        throw std::runtime_error(st.ToString());
+      }
     }
   }
 
@@ -125,15 +131,27 @@ EngineBenchContext &AppendContext() {
   return *ctx;
 }
 
-EngineBenchContext &ReadHitContext() {
-  static auto *ctx =
-      new EngineBenchContext("engine_bench_read_hit", 16, 512, 16, 64);
+EngineBenchContext &MemTableHitContext() {
+  static auto *ctx = new EngineBenchContext("engine_bench_memtable_hit", 32,
+                                            4096, 64, 64, false, false, true);
   return *ctx;
 }
 
-EngineBenchContext &ReadMissCacheContext() {
-  static auto *ctx =
-      new EngineBenchContext("engine_bench_read_miss", 16, 20000, 16, 1);
+EngineBenchContext &BlockCacheHitContext() {
+  static auto *ctx = new EngineBenchContext("engine_bench_block_cache_hit", 32,
+                                            8192, 64, 64, true, false, true);
+  return *ctx;
+}
+
+EngineBenchContext &PageCacheReadContext() {
+  static auto *ctx = new EngineBenchContext("engine_bench_page_cache_read", 32,
+                                            50000, 64, 1, true, false, false);
+  return *ctx;
+}
+
+EngineBenchContext &DirectReadContext() {
+  static auto *ctx = new EngineBenchContext("engine_bench_direct_read", 32,
+                                            50000, 64, 1, true, true, false);
   return *ctx;
 }
 
@@ -193,8 +211,8 @@ static void BM_AppendFeature(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations());
 }
 
-static void BM_GetFeatureCacheHit(benchmark::State &state) {
-  auto &ctx = ReadHitContext();
+static void BM_GetFeatureMemTableHit(benchmark::State &state) {
+  auto &ctx = MemTableHitContext();
   const uint64_t hot_uid = ctx.uids.front();
   auto warm = ctx.engine.GetFeature(ctx.table_id, hot_uid, ctx.version);
   if (!warm.ok()) {
@@ -212,8 +230,42 @@ static void BM_GetFeatureCacheHit(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations());
 }
 
-static void BM_GetFeatureCacheMiss(benchmark::State &state) {
-  auto &ctx = ReadMissCacheContext();
+static void BM_GetFeatureBlockCacheHit(benchmark::State &state) {
+  auto &ctx = BlockCacheHitContext();
+  const uint64_t hot_uid = ctx.uids.front();
+  auto warm = ctx.engine.GetFeature(ctx.table_id, hot_uid, ctx.version);
+  if (!warm.ok()) {
+    state.SkipWithError(warm.status().ToString().c_str());
+    return;
+  }
+  for (auto _ : state) {
+    auto res = ctx.engine.GetFeature(ctx.table_id, hot_uid, ctx.version);
+    if (!res.ok()) {
+      state.SkipWithError(res.status().ToString().c_str());
+      break;
+    }
+    benchmark::DoNotOptimize(*res);
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+
+static void BM_GetFeaturePageCacheRead(benchmark::State &state) {
+  auto &ctx = PageCacheReadContext();
+  std::size_t index = 0;
+  for (auto _ : state) {
+    const uint64_t uid = ctx.uids[index++ % ctx.uids.size()];
+    auto res = ctx.engine.GetFeature(ctx.table_id, uid, ctx.version);
+    if (!res.ok()) {
+      state.SkipWithError(res.status().ToString().c_str());
+      break;
+    }
+    benchmark::DoNotOptimize(*res);
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+
+static void BM_GetFeatureDirectRead(benchmark::State &state) {
+  auto &ctx = DirectReadContext();
   std::size_t index = 0;
   for (auto _ : state) {
     const uint64_t uid = ctx.uids[index++ % ctx.uids.size()];
@@ -566,8 +618,10 @@ BENCHMARK(BM_BatchAppendFeature)
     ->Arg(1000)
     ->UseRealTime();
 
-BENCHMARK(BM_GetFeatureCacheHit);
-BENCHMARK(BM_GetFeatureCacheMiss);
+BENCHMARK(BM_GetFeatureMemTableHit);
+BENCHMARK(BM_GetFeatureBlockCacheHit);
+BENCHMARK(BM_GetFeaturePageCacheRead);
+BENCHMARK(BM_GetFeatureDirectRead);
 
 BENCHMARK(BM_BatchGet)->Arg(1)->Arg(10)->Arg(100)->Arg(1000);
 BENCHMARK(BM_GetWithProjection)->Arg(0)->Arg(1);
