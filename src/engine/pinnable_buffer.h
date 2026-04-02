@@ -6,6 +6,8 @@
 #include <arrow/buffer.h>
 #include <rocksdb/slice.h>
 
+#include "metrics.h"
+
 namespace feature_store {
 
 class PinnableBuffer : public arrow::Buffer {
@@ -16,6 +18,18 @@ public:
           pinnable_(std::move(pinnable)) {}
 
     bool IsPinned() const { return pinnable_.IsPinned(); }
+
+    ~PinnableBuffer() {
+        Metrics::Global()->AddPinnableActive(-1);
+    }
+
+private:
+    void OnConstruct() { Metrics::Global()->AddPinnableActive(+1); }
+
+    // Ensure constructor increments after moving slice in
+    struct ConstructorHook {
+        explicit ConstructorHook(PinnableBuffer* self) { self->OnConstruct(); }
+    } hook_{this};
 
 private:
     rocksdb::PinnableSlice pinnable_;

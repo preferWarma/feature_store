@@ -7,6 +7,7 @@
 #include <string>
 
 #include "frame_codec.h"
+#include "metrics.h"
 
 namespace feature_store {
 namespace {
@@ -59,7 +60,11 @@ ScanResult ScanFrames(std::span<const uint8_t> bytes,
                     kept_frames->append(reinterpret_cast<const char*>(frame_span.data()),
                                         frame_span.size());
                 }
+            } else {
+                Metrics::Global()->IncTTLExpiredFrames(1);
             }
+        } else {
+            Metrics::Global()->IncCRCError(1);
         }
         offset += frame_size;
     }
@@ -112,6 +117,7 @@ bool ArrowTTLFilter::Filter(int,
     }
     if (!scan.any_valid_kept) {
         *value_changed = false;
+        Metrics::Global()->IncTTLExpiredKeys(1);
         return true;
     }
 

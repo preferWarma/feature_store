@@ -29,6 +29,7 @@ add_library(feature_store_engine
     src/engine/column_projection.cc
     src/engine/frame_codec.cc
     src/engine/engine_config.cc
+    src/engine/metrics.cc
     src/engine/schema_registry.cc
 )
 

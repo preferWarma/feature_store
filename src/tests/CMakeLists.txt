@@ -111,3 +111,15 @@ target_link_libraries(arrow_rocks_engine_lifecycle_test
 )
 
 add_test(NAME arrow_rocks_engine_lifecycle_test COMMAND arrow_rocks_engine_lifecycle_test)
+
+add_executable(metrics_test
+    ${PROJECT_SOURCE_DIR}/src/tests/metrics_test.cc
+)
+
+target_link_libraries(metrics_test
+    PRIVATE
+    feature_store_engine
+    GTest::gtest_main
+)
+
+add_test(NAME metrics_test COMMAND metrics_test)

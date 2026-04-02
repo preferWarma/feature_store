@@ -6,6 +6,7 @@
 #include <string>
 
 #include "frame_codec.h"
+#include "metrics.h"
 
 namespace feature_store {
 namespace {
@@ -78,6 +79,8 @@ std::size_t AppendValidFrames(std::span<const uint8_t> bytes, std::string* out) 
         if (ValidateFrameCRC(frame_span)) {
             out->append(reinterpret_cast<const char*>(frame_span.data()), frame_span.size());
             appended += frame_span.size();
+        } else {
+            Metrics::Global()->IncCRCError(1);
         }
         offset += frame_size;
     }

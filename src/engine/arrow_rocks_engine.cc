@@ -25,6 +25,7 @@
 #include "column_projection.h"
 #include "frame_codec.h"
 #include "key_encoder.h"
+#include "metrics.h"
 #include "pinnable_buffer.h"
 
 namespace feature_store {
@@ -244,6 +245,8 @@ arrow::Status ArrowRocksEngine::Init(const EngineConfig &config) {
   ARROW_RETURN_NOT_OK(CleanupOrphanCFs());
   active_cf_count_.store(static_cast<uint32_t>(cf_handles_.size()),
                          std::memory_order_relaxed);
+  Metrics::Global()->SetActiveCFCount(
+      active_cf_count_.load(std::memory_order_relaxed));
   state_ = EngineState::kReady;
   return arrow::Status::OK();
 }
@@ -300,6 +303,8 @@ arrow::Status ArrowRocksEngine::EnsureCF(uint16_t table_id) {
   ARROW_RETURN_NOT_OK(ToArrowStatus(s));
   cf_handles_.emplace(table_id, h);
   active_cf_count_.fetch_add(1, std::memory_order_relaxed);
+  Metrics::Global()->SetActiveCFCount(
+      active_cf_count_.load(std::memory_order_relaxed));
   return arrow::Status::OK();
 }
 
@@ -355,6 +360,7 @@ arrow::Status
 ArrowRocksEngine::AppendFeature(uint16_t table_id, uint64_t uid,
                                 uint16_t schema_version,
                                 const arrow::RecordBatch &delta_batch) {
+  const auto start = std::chrono::steady_clock::now();
   if (state_ != EngineState::kReady) {
     return arrow::Status::Invalid("engine not ready");
   }
@@ -374,6 +380,14 @@ ArrowRocksEngine::AppendFeature(uint16_t table_id, uint64_t uid,
                           .count()),
                   delta_batch));
   auto s = db_->Merge(write_opts_, cf, EncodeKey(uid), frame);
+  const auto latency_us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - start)
+          .count());
+  if (s.ok()) {
+    Metrics::Global()->IncAppend(table_id, static_cast<uint64_t>(frame.size()),
+                                 latency_us);
+  }
   return ToArrowStatus(s);
 }
 
@@ -401,6 +415,7 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>>
 ArrowRocksEngine::GetFeature(uint16_t table_id, uint64_t uid,
                              uint16_t target_version,
                              const std::vector<std::string> &columns) {
+  const auto start = std::chrono::steady_clock::now();
   if (state_ != EngineState::kReady) {
     return arrow::Status::Invalid("engine not ready");
   }
@@ -420,6 +435,11 @@ ArrowRocksEngine::GetFeature(uint16_t table_id, uint64_t uid,
   rocksdb::PinnableSlice pinnable;
   auto s = db_->Get(read_opts_, cf, EncodeKey(uid), &pinnable);
   if (!s.ok()) {
+    const auto latency_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count());
+    Metrics::Global()->IncGet(table_id, false, latency_us, 1.0);
     return ToArrowStatus(s);
   }
 
@@ -429,6 +449,7 @@ ArrowRocksEngine::GetFeature(uint16_t table_id, uint64_t uid,
 
   const auto selected = SelectLatestValidFrame(bytes);
   if (!selected.found) {
+    Metrics::Global()->IncCRCError(1);
     return arrow::Status::SerializationError("no valid frame");
   }
 
@@ -443,14 +464,24 @@ ArrowRocksEngine::GetFeature(uint16_t table_id, uint64_t uid,
   }
 
   if (!columns.empty()) {
-    return ProjectColumns(batch, columns);
+    ARROW_ASSIGN_OR_RAISE(batch, ProjectColumns(batch, columns));
   }
+  const double projection_ratio =
+      static_cast<double>(columns.empty() ? batch->num_columns()
+                                          : columns.size()) /
+      static_cast<double>(target_schema->num_fields());
+  const auto latency_us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - start)
+          .count());
+  Metrics::Global()->IncGet(table_id, true, latency_us, projection_ratio);
   return batch;
 }
 
 std::vector<BatchGetResult> ArrowRocksEngine::BatchGetFeature(
     const std::vector<BatchGetRequest> &requests) {
   std::vector<BatchGetResult> results(requests.size());
+  Metrics::Global()->IncBatchGet(1, static_cast<uint64_t>(requests.size()));
   if (state_ != EngineState::kReady) {
     for (std::size_t i = 0; i < requests.size(); ++i) {
       results[i] = {requests[i].uid, arrow::Status::Invalid("engine not ready"),
@@ -472,9 +503,15 @@ std::vector<BatchGetResult> ArrowRocksEngine::BatchGetFeature(
   }
 
   for (auto &[table_id, indices] : groups) {
+    const auto group_start = std::chrono::steady_clock::now();
     auto *cf = GetCF(table_id);
     if (!cf) {
       for (auto idx : indices) {
+        const auto latency_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - group_start)
+                .count());
+        Metrics::Global()->IncGet(table_id, false, latency_us, 1.0);
         results[idx] = {requests[idx].uid,
                         arrow::Status::KeyError("table not found"), nullptr};
       }
@@ -497,7 +534,12 @@ std::vector<BatchGetResult> ArrowRocksEngine::BatchGetFeature(
 
     for (std::size_t j = 0; j < indices.size(); ++j) {
       const auto idx = indices[j];
+      const auto latency_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - group_start)
+              .count());
       if (!statuses[j].ok()) {
+        Metrics::Global()->IncGet(table_id, false, latency_us, 1.0);
         results[idx] = {requests[idx].uid, ToArrowStatus(statuses[j]), nullptr};
         continue;
       }
@@ -505,6 +547,7 @@ std::vector<BatchGetResult> ArrowRocksEngine::BatchGetFeature(
       auto target_schema =
           registry_.Get(table_id, requests[idx].target_version);
       if (!target_schema) {
+        Metrics::Global()->IncGet(table_id, false, latency_us, 1.0);
         results[idx] = {requests[idx].uid,
                         arrow::Status::KeyError("schema not found"), nullptr};
         continue;
@@ -517,6 +560,8 @@ std::vector<BatchGetResult> ArrowRocksEngine::BatchGetFeature(
           static_cast<std::size_t>(pinned_buffer->size()));
       const auto selected = SelectLatestValidFrame(bytes);
       if (!selected.found) {
+        Metrics::Global()->IncCRCError(1);
+        Metrics::Global()->IncGet(table_id, false, latency_us, 1.0);
         results[idx] = {requests[idx].uid,
                         arrow::Status::SerializationError("no valid frame"),
                         nullptr};
@@ -530,6 +575,7 @@ std::vector<BatchGetResult> ArrowRocksEngine::BatchGetFeature(
 
       auto batch_res = ReadSingleRecordBatchFromIPC(ipc_slice);
       if (!batch_res.ok()) {
+        Metrics::Global()->IncGet(table_id, false, latency_us, 1.0);
         results[idx] = {requests[idx].uid, batch_res.status(), nullptr};
         continue;
       }
@@ -538,6 +584,7 @@ std::vector<BatchGetResult> ArrowRocksEngine::BatchGetFeature(
       if (!batch->schema()->Equals(*target_schema, false)) {
         auto projected = ProjectToSchema(batch, target_schema);
         if (!projected.ok()) {
+          Metrics::Global()->IncGet(table_id, false, latency_us, 1.0);
           results[idx] = {requests[idx].uid, projected.status(), nullptr};
           continue;
         }
@@ -547,12 +594,19 @@ std::vector<BatchGetResult> ArrowRocksEngine::BatchGetFeature(
       if (!requests[idx].columns.empty()) {
         auto projected_cols = ProjectColumns(batch, requests[idx].columns);
         if (!projected_cols.ok()) {
+          Metrics::Global()->IncGet(table_id, false, latency_us, 1.0);
           results[idx] = {requests[idx].uid, projected_cols.status(), nullptr};
           continue;
         }
         batch = projected_cols.ValueOrDie();
       }
 
+      const double projection_ratio =
+          static_cast<double>(requests[idx].columns.empty()
+                                  ? batch->num_columns()
+                                  : requests[idx].columns.size()) /
+          static_cast<double>(target_schema->num_fields());
+      Metrics::Global()->IncGet(table_id, true, latency_us, projection_ratio);
       results[idx] = {requests[idx].uid, arrow::Status::OK(), std::move(batch)};
     }
   }
@@ -607,6 +661,9 @@ arrow::Status ArrowRocksEngine::DropTable(uint16_t table_id) {
   db_->DestroyColumnFamilyHandle(cf);
   cf_handles_.erase(table_id);
   active_cf_count_.fetch_sub(1, std::memory_order_relaxed);
+  Metrics::Global()->SetActiveCFCount(
+      active_cf_count_.load(std::memory_order_relaxed));
+  Metrics::Global()->IncCfDrop(1);
   return arrow::Status::OK();
 }
 
