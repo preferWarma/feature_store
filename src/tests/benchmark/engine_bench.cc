@@ -150,10 +150,11 @@ EngineBenchContext &BatchContext() {
 }
 
 std::string MakeMergedValue(int frame_count, uint16_t schema_version,
-                            const std::shared_ptr<arrow::Schema> &schema) {
+                            const std::shared_ptr<arrow::Schema> &schema,
+                            int64_t rows_per_frame = 8, int64_t seed_base = 0) {
   std::string out;
   for (int i = 0; i < frame_count; ++i) {
-    auto batch = MakeBatch(schema, 8, i * 10);
+    auto batch = MakeBatch(schema, rows_per_frame, seed_base + i * 10);
     auto encoded = EncodeFrame(schema_version, NowMs() + i, *batch);
     if (!encoded.ok()) {
       throw std::runtime_error(encoded.status().ToString());
@@ -161,6 +162,20 @@ std::string MakeMergedValue(int frame_count, uint16_t schema_version,
     out += encoded.ValueOrDie();
   }
   return out;
+}
+
+std::vector<std::string>
+NamesOfFirst(const std::shared_ptr<arrow::Schema> &schema, int count) {
+  std::vector<std::string> cols;
+  if (count <= 0) {
+    return cols;
+  }
+  const int n = std::min<int>(count, schema->num_fields());
+  cols.reserve(static_cast<std::size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    cols.push_back(schema->field(i)->name());
+  }
+  return cols;
 }
 
 static void BM_AppendFeature(benchmark::State &state) {
@@ -276,13 +291,116 @@ static void BM_GetWithProjection(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations());
 }
 
-static void BM_MergeOperator(benchmark::State &state) {
+static void BM_GetWithProjectionCols(benchmark::State &state) {
+  auto &ctx = ProjectionContext();
+  const int select_cols = static_cast<int>(state.range(0));
+  const auto columns = NamesOfFirst(ctx.schema, select_cols);
+  std::size_t index = 0;
+  for (auto _ : state) {
+    const uint64_t uid = ctx.uids[index++ % ctx.uids.size()];
+    auto res = ctx.engine.GetFeature(ctx.table_id, uid, ctx.version, columns);
+    if (!res.ok()) {
+      state.SkipWithError(res.status().ToString().c_str());
+      break;
+    }
+    benchmark::DoNotOptimize(*res);
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+
+struct EvolvedBenchContext {
+  ArrowRocksEngine engine;
+  uint16_t table_id = 1;
+  uint16_t v1 = 1;
+  uint16_t v2 = 2;
+  std::vector<uint64_t> uids;
+  std::vector<std::string> new_only_cols{"b"};
+
+  EvolvedBenchContext(const std::string &name, int64_t preload_keys,
+                      std::size_t cache_mb) {
+    EngineConfig cfg;
+    cfg.db_path = TempPath(name);
+    cfg.block_cache_size_mb = cache_mb;
+    cfg.disable_wal = true;
+    cfg.ttl_days = 30;
+    auto st = engine.Init(cfg);
+    if (!st.ok()) {
+      throw std::runtime_error(st.ToString());
+    }
+
+    auto schema_v1 = arrow::schema({arrow::field("a", arrow::int64())});
+    auto schema_v2 = arrow::schema({arrow::field("a", arrow::int64()),
+                                    arrow::field("b", arrow::int32(), true)});
+    st = engine.RegisterSchema(table_id, v1, schema_v1);
+    if (!st.ok()) {
+      throw std::runtime_error(st.ToString());
+    }
+    st = engine.RegisterSchema(table_id, v2, schema_v2);
+    if (!st.ok()) {
+      throw std::runtime_error(st.ToString());
+    }
+
+    for (int64_t i = 0; i < preload_keys; ++i) {
+      const uint64_t uid = static_cast<uint64_t>(i + 1);
+      arrow::Int64Builder a_builder;
+      auto append_st = a_builder.Append(100 + i);
+      if (!append_st.ok()) {
+        throw std::runtime_error(append_st.ToString());
+      }
+      std::shared_ptr<arrow::Int64Array> a_arr;
+      auto finish_st = a_builder.Finish(&a_arr);
+      if (!finish_st.ok()) {
+        throw std::runtime_error(finish_st.ToString());
+      }
+      auto batch = arrow::RecordBatch::Make(schema_v1, 1, {a_arr});
+      st = engine.PutFeature(table_id, uid, v1, NowMs() + i, *batch);
+      if (!st.ok()) {
+        throw std::runtime_error(st.ToString());
+      }
+      uids.push_back(uid);
+    }
+    st = engine.FlushAll();
+    if (!st.ok()) {
+      throw std::runtime_error(st.ToString());
+    }
+    st = engine.CompactAll();
+    if (!st.ok()) {
+      throw std::runtime_error(st.ToString());
+    }
+  }
+
+  ~EvolvedBenchContext() { (void)engine.Close(); }
+};
+
+EvolvedBenchContext &EvolvedProjectionContext() {
+  static auto *ctx =
+      new EvolvedBenchContext("engine_bench_evolved_projection", 2048, 64);
+  return *ctx;
+}
+
+static void BM_GetEvolvedProjectionNewOnly(benchmark::State &state) {
+  auto &ctx = EvolvedProjectionContext();
+  std::size_t index = 0;
+  for (auto _ : state) {
+    const uint64_t uid = ctx.uids[index++ % ctx.uids.size()];
+    auto res =
+        ctx.engine.GetFeature(ctx.table_id, uid, ctx.v2, ctx.new_only_cols);
+    if (!res.ok()) {
+      state.SkipWithError(res.status().ToString().c_str());
+      break;
+    }
+    benchmark::DoNotOptimize(*res);
+  }
+  state.SetItemsProcessed(state.iterations());
+}
+
+static void BM_PartialMergeFastPath(benchmark::State &state) {
   SchemaRegistry registry;
   ArrowMergeOperator merge_op(&registry);
-  auto schema = MakeSchema(8);
+  auto schema = MakeSchema(32);
   const int frame_count = static_cast<int>(state.range(0));
-  std::string left = MakeMergedValue(frame_count, 1, schema);
-  std::string right = MakeMergedValue(frame_count, 1, schema);
+  std::string left = MakeMergedValue(frame_count, 1, schema, 512, 0);
+  std::string right = MakeMergedValue(frame_count, 1, schema, 512, 100000);
   const rocksdb::Slice key("k");
 
   for (auto _ : state) {
@@ -298,6 +416,123 @@ static void BM_MergeOperator(benchmark::State &state) {
   state.SetItemsProcessed(state.iterations() * frame_count * 2);
   state.SetBytesProcessed(state.iterations() *
                           static_cast<int64_t>(left.size() + right.size()));
+}
+
+static void BM_PartialMergeFallback(benchmark::State &state) {
+  SchemaRegistry registry;
+  ArrowMergeOperator merge_op(&registry);
+  auto schema = MakeSchema(32);
+  const int frame_count = static_cast<int>(state.range(0));
+  std::string left = MakeMergedValue(frame_count, 1, schema, 512, 0);
+  std::string right = MakeMergedValue(frame_count, 2, schema, 512, 100000);
+  const rocksdb::Slice key("k");
+
+  for (auto _ : state) {
+    std::string out;
+    bool ok = merge_op.PartialMerge(key, rocksdb::Slice(left),
+                                    rocksdb::Slice(right), &out, nullptr);
+    if (!ok) {
+      state.SkipWithError("PartialMerge fallback failed");
+      break;
+    }
+    benchmark::DoNotOptimize(out);
+  }
+  state.SetItemsProcessed(state.iterations() * frame_count * 2);
+  state.SetBytesProcessed(state.iterations() *
+                          static_cast<int64_t>(left.size() + right.size()));
+}
+
+static void BM_FullMergeV2ManyTinyOperands(benchmark::State &state) {
+  SchemaRegistry registry;
+  ArrowMergeOperator merge_op(&registry);
+  auto schema = MakeSchema(8);
+  const int operand_count = static_cast<int>(state.range(0));
+  std::string existing = MakeMergedValue(1, 1, schema, 8, 0);
+
+  std::vector<std::string> operand_storage;
+  operand_storage.reserve(static_cast<std::size_t>(operand_count));
+  for (int i = 0; i < operand_count; ++i) {
+    operand_storage.push_back(MakeMergedValue(1, 1, schema, 8, i * 1000));
+  }
+
+  std::vector<rocksdb::Slice> operands;
+  operands.reserve(operand_storage.size());
+  for (const auto &op : operand_storage) {
+    operands.emplace_back(op);
+  }
+
+  const rocksdb::Slice key("k");
+  const rocksdb::Slice existing_slice(existing);
+  rocksdb::MergeOperator::MergeOperationInput merge_in(key, &existing_slice,
+                                                       operands, nullptr);
+
+  for (auto _ : state) {
+    std::string merged;
+    rocksdb::Slice existing_operand;
+    rocksdb::MergeOperator::MergeOperationOutput merge_out(merged,
+                                                           existing_operand);
+    bool ok = merge_op.FullMergeV2(merge_in, &merge_out);
+    if (!ok) {
+      state.SkipWithError("FullMergeV2 failed");
+      break;
+    }
+    benchmark::DoNotOptimize(merged);
+  }
+
+  int64_t total_bytes = static_cast<int64_t>(existing.size());
+  for (const auto &op : operand_storage) {
+    total_bytes += static_cast<int64_t>(op.size());
+  }
+  state.SetItemsProcessed(state.iterations() * operand_count);
+  state.SetBytesProcessed(state.iterations() * total_bytes);
+}
+
+static void BM_FullMergeV2FewBigOperands(benchmark::State &state) {
+  SchemaRegistry registry;
+  ArrowMergeOperator merge_op(&registry);
+  auto schema = MakeSchema(32);
+  const int frames_per_operand = static_cast<int>(state.range(0));
+  constexpr int operand_count = 4;
+  std::string existing = MakeMergedValue(frames_per_operand, 1, schema, 512, 0);
+
+  std::vector<std::string> operand_storage;
+  operand_storage.reserve(operand_count);
+  for (int i = 0; i < operand_count; ++i) {
+    operand_storage.push_back(
+        MakeMergedValue(frames_per_operand, 1, schema, 512, i * 100000));
+  }
+
+  std::vector<rocksdb::Slice> operands;
+  operands.reserve(operand_storage.size());
+  for (const auto &op : operand_storage) {
+    operands.emplace_back(op);
+  }
+
+  const rocksdb::Slice key("k");
+  const rocksdb::Slice existing_slice(existing);
+  rocksdb::MergeOperator::MergeOperationInput merge_in(key, &existing_slice,
+                                                       operands, nullptr);
+
+  for (auto _ : state) {
+    std::string merged;
+    rocksdb::Slice existing_operand;
+    rocksdb::MergeOperator::MergeOperationOutput merge_out(merged,
+                                                           existing_operand);
+    bool ok = merge_op.FullMergeV2(merge_in, &merge_out);
+    if (!ok) {
+      state.SkipWithError("FullMergeV2 few-big-operands failed");
+      break;
+    }
+    benchmark::DoNotOptimize(merged);
+  }
+
+  int64_t total_bytes = static_cast<int64_t>(existing.size());
+  for (const auto &op : operand_storage) {
+    total_bytes += static_cast<int64_t>(op.size());
+  }
+  state.SetItemsProcessed(state.iterations() * operand_count *
+                          frames_per_operand);
+  state.SetBytesProcessed(state.iterations() * total_bytes);
 }
 
 static void BM_CRC32C(benchmark::State &state) {
@@ -336,7 +571,12 @@ BENCHMARK(BM_GetFeatureCacheMiss);
 
 BENCHMARK(BM_BatchGet)->Arg(1)->Arg(10)->Arg(100)->Arg(1000);
 BENCHMARK(BM_GetWithProjection)->Arg(0)->Arg(1);
-BENCHMARK(BM_MergeOperator)->Arg(1)->Arg(10)->Arg(100);
+BENCHMARK(BM_GetWithProjectionCols)->Arg(8)->Arg(16)->Arg(32)->Arg(64);
+BENCHMARK(BM_GetEvolvedProjectionNewOnly);
+BENCHMARK(BM_PartialMergeFastPath)->Arg(1)->Arg(10)->Arg(100);
+BENCHMARK(BM_PartialMergeFallback)->Arg(1)->Arg(10)->Arg(100);
+BENCHMARK(BM_FullMergeV2ManyTinyOperands)->Arg(10)->Arg(100)->Arg(1000);
+BENCHMARK(BM_FullMergeV2FewBigOperands)->Arg(1)->Arg(10)->Arg(100);
 BENCHMARK(BM_CRC32C)->Arg(256)->Arg(4096)->Arg(65536);
 
 } // namespace
