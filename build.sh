@@ -1,7 +1,10 @@
 #!/bin/bash
 set -e
 
-export VCPKG_ROOT="/Users/liuyifeng/vcpkg"
+# 1. 克隆 vcpkg 仓库
+# git clone https://github.com/microsoft/vcpkg.git ~/vcpkg
+# ~/vcpkg/bootstrap-vcpkg.sh
+export VCPKG_ROOT="$HOME/vcpkg"
 
 # 确保 VCPKG_ROOT 环境变量已经生效，避免路径为空导致找不到 vcpkg.cmake
 if [ -z "$VCPKG_ROOT" ]; then
@@ -11,6 +14,7 @@ if [ -z "$VCPKG_ROOT" ]; then
 fi
 
 # 让 vcpkg 优先使用 Homebrew 安装的最新版 bison 和 flex
+# brew install bison flex
 export PATH="/opt/homebrew/opt/bison/bin:/opt/homebrew/opt/flex/bin:$PATH"
 export LDFLAGS="-L/opt/homebrew/opt/bison/lib -L/opt/homebrew/opt/flex/lib"
 export CPPFLAGS="-I/opt/homebrew/opt/bison/include -I/opt/homebrew/opt/flex/include"
