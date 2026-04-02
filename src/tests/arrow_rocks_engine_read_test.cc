@@ -97,6 +97,30 @@ TEST(ArrowRocksEngineReadTest, ColumnProjectionWorks) {
     EXPECT_EQ(bad.status().code(), arrow::StatusCode::KeyError);
 }
 
+TEST(ArrowRocksEngineReadTest, ColumnProjectionReadsOnlyRequestedEvolvedColumns) {
+    ArrowRocksEngine engine;
+    EngineConfig cfg;
+    cfg.db_path = TempDBPath("feature_store_read_test_proj_evolved");
+    cfg.block_cache_size_mb = 64;
+    ASSERT_TRUE(engine.Init(cfg).ok());
+
+    ASSERT_TRUE(engine.RegisterSchema(1, 1, SchemaV1()).ok());
+    ASSERT_TRUE(engine.RegisterSchema(1, 2, SchemaV2()).ok());
+    ASSERT_TRUE(engine.AppendFeature(1, 100, 1, *MakeV1Batch(10)).ok());
+    ASSERT_TRUE(engine.FlushAll().ok());
+    ASSERT_TRUE(engine.CompactAll().ok());
+
+    auto res = engine.GetFeature(1, 100, 2, {"b"});
+    ASSERT_TRUE(res.ok()) << res.status().ToString();
+    ASSERT_EQ((*res)->num_columns(), 1);
+    EXPECT_EQ((*res)->schema()->field(0)->name(), "b");
+
+    auto b = std::static_pointer_cast<arrow::Int32Array>((*res)->column(0));
+    ASSERT_NE(b, nullptr);
+    ASSERT_EQ(b->length(), 1);
+    EXPECT_TRUE(b->IsNull(0));
+}
+
 TEST(ArrowRocksEngineReadTest, BatchGetAcrossTablesAndMissingKeys) {
     ArrowRocksEngine engine;
     EngineConfig cfg;

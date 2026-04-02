@@ -1,5 +1,6 @@
 #include "arrow_rocks_engine.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -28,7 +29,6 @@
 
 #include "arrow_merge_operator.h"
 #include "arrow_ttl_filter.h"
-#include "column_projection.h"
 #include "frame_codec.h"
 #include "key_encoder.h"
 #include "metrics.h"
@@ -53,10 +53,12 @@ std::span<const uint8_t> AsSpan(const rocksdb::PinnableSlice &s) {
 }
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>>
-ReadSingleRecordBatchFromIPC(const std::shared_ptr<arrow::Buffer> &ipc) {
+ReadSingleRecordBatchFromIPC(const std::shared_ptr<arrow::Buffer> &ipc,
+                             const arrow::ipc::IpcReadOptions &options =
+                                 arrow::ipc::IpcReadOptions::Defaults()) {
   auto input = std::make_shared<arrow::io::BufferReader>(ipc);
-  ARROW_ASSIGN_OR_RAISE(auto reader,
-                        arrow::ipc::RecordBatchStreamReader::Open(input));
+  ARROW_ASSIGN_OR_RAISE(
+      auto reader, arrow::ipc::RecordBatchStreamReader::Open(input, options));
   ARROW_ASSIGN_OR_RAISE(auto batch, reader->Next());
   if (!batch) {
     return arrow::Status::SerializationError(
@@ -68,6 +70,84 @@ ReadSingleRecordBatchFromIPC(const std::shared_ptr<arrow::Buffer> &ipc) {
         "IPC stream contains multiple RecordBatches");
   }
   return batch;
+}
+
+struct ProjectionPlan {
+  arrow::ipc::IpcReadOptions read_options =
+      arrow::ipc::IpcReadOptions::Defaults();
+  std::shared_ptr<arrow::Schema> output_schema;
+};
+
+arrow::Result<ProjectionPlan>
+BuildProjectionPlan(const std::shared_ptr<arrow::Schema> &source_schema,
+                    const std::shared_ptr<arrow::Schema> &target_schema,
+                    const std::vector<std::string> &columns) {
+  if (!source_schema) {
+    return arrow::Status::Invalid("source schema is null");
+  }
+  if (!target_schema) {
+    return arrow::Status::Invalid("target schema is null");
+  }
+
+  ProjectionPlan plan;
+  std::vector<int> included_fields;
+  std::vector<std::shared_ptr<arrow::Field>> output_fields;
+
+  const auto append_target_field =
+      [&](const std::shared_ptr<arrow::Field> &field) -> arrow::Status {
+    output_fields.push_back(field);
+    const int src_idx = source_schema->GetFieldIndex(field->name());
+    if (src_idx >= 0) {
+      const auto &src_field = source_schema->field(src_idx);
+      if (!src_field->type()->Equals(field->type())) {
+        return arrow::Status::Invalid("field type mismatch: " + field->name());
+      }
+      included_fields.push_back(src_idx);
+    }
+    return arrow::Status::OK();
+  };
+
+  if (columns.empty()) {
+    output_fields = target_schema->fields();
+    for (const auto &field : target_schema->fields()) {
+      const int src_idx = source_schema->GetFieldIndex(field->name());
+      if (src_idx >= 0) {
+        const auto &src_field = source_schema->field(src_idx);
+        if (!src_field->type()->Equals(field->type())) {
+          return arrow::Status::Invalid("field type mismatch: " +
+                                        field->name());
+        }
+        included_fields.push_back(src_idx);
+      }
+    }
+  } else {
+    output_fields.reserve(columns.size());
+    included_fields.reserve(columns.size());
+    for (const auto &col : columns) {
+      const int target_idx = target_schema->GetFieldIndex(col);
+      if (target_idx < 0) {
+        return arrow::Status::KeyError("Column not found: " + col);
+      }
+      ARROW_RETURN_NOT_OK(
+          append_target_field(target_schema->field(target_idx)));
+    }
+  }
+
+  std::sort(included_fields.begin(), included_fields.end());
+  included_fields.erase(
+      std::unique(included_fields.begin(), included_fields.end()),
+      included_fields.end());
+
+  if (included_fields.empty() && source_schema->num_fields() > 0) {
+    included_fields.push_back(0);
+  }
+  if (static_cast<int>(included_fields.size()) < source_schema->num_fields()) {
+    plan.read_options.included_fields = included_fields;
+  }
+
+  plan.output_schema =
+      columns.empty() ? target_schema : arrow::schema(output_fields);
+  return plan;
 }
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>>
@@ -576,14 +656,20 @@ ArrowRocksEngine::GetFeature(uint16_t table_id, uint64_t uid,
   auto ipc_slice = std::make_shared<arrow::Buffer>(
       pinned_buffer, static_cast<int64_t>(ipc_offset),
       static_cast<int64_t>(selected.header.ipc_length));
-  ARROW_ASSIGN_OR_RAISE(auto batch, ReadSingleRecordBatchFromIPC(ipc_slice));
-
-  if (!batch->schema()->Equals(*target_schema, false)) {
-    ARROW_ASSIGN_OR_RAISE(batch, ProjectToSchema(batch, target_schema));
+  auto source_schema = registry_.Get(table_id, selected.header.schema_version);
+  if (!source_schema) {
+    return arrow::Status::KeyError("source schema not found");
   }
+  ARROW_ASSIGN_OR_RAISE(
+      auto projection_plan,
+      BuildProjectionPlan(source_schema, target_schema, columns));
+  ARROW_ASSIGN_OR_RAISE(
+      auto batch,
+      ReadSingleRecordBatchFromIPC(ipc_slice, projection_plan.read_options));
 
-  if (!columns.empty()) {
-    ARROW_ASSIGN_OR_RAISE(batch, ProjectColumns(batch, columns));
+  if (!batch->schema()->Equals(*projection_plan.output_schema, false)) {
+    ARROW_ASSIGN_OR_RAISE(
+        batch, ProjectToSchema(batch, projection_plan.output_schema));
   }
   const double projection_ratio =
       static_cast<double>(columns.empty() ? batch->num_columns()
@@ -692,7 +778,25 @@ std::vector<BatchGetResult> ArrowRocksEngine::BatchGetFeature(
           pinned_buffer, static_cast<int64_t>(ipc_offset),
           static_cast<int64_t>(selected.header.ipc_length));
 
-      auto batch_res = ReadSingleRecordBatchFromIPC(ipc_slice);
+      auto source_schema =
+          registry_.Get(table_id, selected.header.schema_version);
+      if (!source_schema) {
+        Metrics::Global()->IncGet(table_id, false, latency_us, 1.0);
+        results[idx] = {requests[idx].uid,
+                        arrow::Status::KeyError("source schema not found"),
+                        nullptr};
+        continue;
+      }
+      auto projection_plan = BuildProjectionPlan(source_schema, target_schema,
+                                                 requests[idx].columns);
+      if (!projection_plan.ok()) {
+        Metrics::Global()->IncGet(table_id, false, latency_us, 1.0);
+        results[idx] = {requests[idx].uid, projection_plan.status(), nullptr};
+        continue;
+      }
+
+      auto batch_res = ReadSingleRecordBatchFromIPC(
+          ipc_slice, projection_plan.ValueOrDie().read_options);
       if (!batch_res.ok()) {
         Metrics::Global()->IncGet(table_id, false, latency_us, 1.0);
         results[idx] = {requests[idx].uid, batch_res.status(), nullptr};
@@ -700,24 +804,16 @@ std::vector<BatchGetResult> ArrowRocksEngine::BatchGetFeature(
       }
       auto batch = batch_res.ValueOrDie();
 
-      if (!batch->schema()->Equals(*target_schema, false)) {
-        auto projected = ProjectToSchema(batch, target_schema);
+      if (!batch->schema()->Equals(*projection_plan.ValueOrDie().output_schema,
+                                   false)) {
+        auto projected =
+            ProjectToSchema(batch, projection_plan.ValueOrDie().output_schema);
         if (!projected.ok()) {
           Metrics::Global()->IncGet(table_id, false, latency_us, 1.0);
           results[idx] = {requests[idx].uid, projected.status(), nullptr};
           continue;
         }
         batch = projected.ValueOrDie();
-      }
-
-      if (!requests[idx].columns.empty()) {
-        auto projected_cols = ProjectColumns(batch, requests[idx].columns);
-        if (!projected_cols.ok()) {
-          Metrics::Global()->IncGet(table_id, false, latency_us, 1.0);
-          results[idx] = {requests[idx].uid, projected_cols.status(), nullptr};
-          continue;
-        }
-        batch = projected_cols.ValueOrDie();
       }
 
       const double projection_ratio =
