@@ -78,6 +78,26 @@ struct ProjectionPlan {
   std::shared_ptr<arrow::Schema> output_schema;
 };
 
+bool IsIdentityProjection(const std::shared_ptr<arrow::Schema> &target_schema,
+                          const std::vector<std::string> &columns) {
+  if (!target_schema) {
+    return false;
+  }
+  if (columns.empty()) {
+    return true;
+  }
+  if (static_cast<int>(columns.size()) != target_schema->num_fields()) {
+    return false;
+  }
+  for (int i = 0; i < target_schema->num_fields(); ++i) {
+    if (columns[static_cast<std::size_t>(i)] !=
+        target_schema->field(i)->name()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 arrow::Result<ProjectionPlan>
 BuildProjectionPlan(const std::shared_ptr<arrow::Schema> &source_schema,
                     const std::shared_ptr<arrow::Schema> &target_schema,
@@ -92,6 +112,7 @@ BuildProjectionPlan(const std::shared_ptr<arrow::Schema> &source_schema,
   ProjectionPlan plan;
   std::vector<int> included_fields;
   std::vector<std::shared_ptr<arrow::Field>> output_fields;
+  const bool identity_projection = IsIdentityProjection(target_schema, columns);
 
   const auto append_target_field =
       [&](const std::shared_ptr<arrow::Field> &field) -> arrow::Status {
@@ -107,7 +128,7 @@ BuildProjectionPlan(const std::shared_ptr<arrow::Schema> &source_schema,
     return arrow::Status::OK();
   };
 
-  if (columns.empty()) {
+  if (identity_projection) {
     output_fields = target_schema->fields();
     for (const auto &field : target_schema->fields()) {
       const int src_idx = source_schema->GetFieldIndex(field->name());
@@ -146,7 +167,7 @@ BuildProjectionPlan(const std::shared_ptr<arrow::Schema> &source_schema,
   }
 
   plan.output_schema =
-      columns.empty() ? target_schema : arrow::schema(output_fields);
+      identity_projection ? target_schema : arrow::schema(output_fields);
   return plan;
 }
 
