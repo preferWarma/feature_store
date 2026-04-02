@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # 寻找依赖（vcpkg 会自动拦截并接管这里的查找逻辑）
 find_package(Arrow REQUIRED)
+find_package(Parquet REQUIRED)
 find_package(RocksDB REQUIRED)
 include(CTest)
 
@@ -42,6 +43,7 @@ target_include_directories(feature_store_engine
 target_link_libraries(feature_store_engine
     PUBLIC
     Arrow::arrow_static
+    Parquet::parquet_static
     RocksDB::rocksdb
 )
 

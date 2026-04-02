@@ -8,7 +8,9 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/io/api.h>
 #include <gtest/gtest.h>
+#include <parquet/arrow/reader.h>
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
 
@@ -161,6 +163,48 @@ TEST(ArrowRocksEngineLifecycleTest, InitCleansOrphanColumnFamily) {
     }
 }
 
+TEST(ArrowRocksEngineLifecycleTest, ArchiveTableExportsParquetAndDropsTable) {
+    const auto path = TempDBPath("feature_store_lifecycle_archive");
+    const auto archive_path =
+        (std::filesystem::temp_directory_path() /
+         std::filesystem::path("feature_store_archive_table.parquet"))
+            .string();
+    std::error_code ec;
+    std::filesystem::remove(archive_path, ec);
+
+    ArrowRocksEngine engine;
+    EngineConfig cfg;
+    cfg.db_path = path;
+    cfg.block_cache_size_mb = 64;
+    ASSERT_TRUE(engine.Init(cfg).ok());
+
+    ASSERT_TRUE(engine.RegisterSchema(1, 1, SchemaV1()).ok());
+    ASSERT_TRUE(engine.PutFeature(1, 10, 1, 111, *MakeBatch(123)).ok());
+    ASSERT_TRUE(engine.PutFeature(1, 20, 1, 222, *MakeBatch(456)).ok());
+    ASSERT_TRUE(engine.FlushAll().ok());
+
+    ASSERT_TRUE(engine.ArchiveTable(1, archive_path).ok());
+    EXPECT_TRUE(std::filesystem::exists(archive_path));
+
+    auto missing = engine.GetFeature(1, 10, 1);
+    ASSERT_FALSE(missing.ok());
+    EXPECT_EQ(missing.status().code(), arrow::StatusCode::KeyError);
+
+    auto input_result = arrow::io::ReadableFile::Open(archive_path);
+    ASSERT_TRUE(input_result.ok()) << input_result.status().ToString();
+    auto reader_result = parquet::arrow::OpenFile(input_result.ValueOrDie(),
+                                                  arrow::default_memory_pool());
+    ASSERT_TRUE(reader_result.ok()) << reader_result.status().ToString();
+    auto reader = std::move(reader_result).ValueOrDie();
+    std::shared_ptr<arrow::Table> table;
+    ASSERT_TRUE(reader->ReadTable(&table).ok());
+    ASSERT_NE(table, nullptr);
+    EXPECT_EQ(table->num_rows(), 2);
+    EXPECT_NE(table->schema()->GetFieldIndex("__uid"), -1);
+    EXPECT_NE(table->schema()->GetFieldIndex("__timestamp"), -1);
+    EXPECT_NE(table->schema()->GetFieldIndex("__schema_version"), -1);
+    EXPECT_NE(table->schema()->GetFieldIndex("a"), -1);
+}
+
 }  // namespace
 }  // namespace feature_store
-

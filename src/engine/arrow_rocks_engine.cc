@@ -4,7 +4,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string>
@@ -14,8 +16,12 @@
 #include <arrow/api.h>
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
+#include <arrow/table.h>
+
+#include <parquet/arrow/writer.h>
 
 #include <rocksdb/cache.h>
+#include <rocksdb/iterator.h>
 #include <rocksdb/options.h>
 #include <rocksdb/slice.h>
 #include <rocksdb/table.h>
@@ -130,6 +136,54 @@ SelectedFrame SelectLatestValidFrame(std::span<const uint8_t> bytes) {
     offset += frame_size;
   }
   return selected;
+}
+
+arrow::Result<std::pair<uint16_t, std::shared_ptr<arrow::Schema>>>
+FindLatestSchemaForArchive(const SchemaRegistry &registry, uint16_t table_id) {
+  for (uint32_t version = std::numeric_limits<uint16_t>::max(); version > 0;
+       --version) {
+    auto schema = registry.Get(table_id, static_cast<uint16_t>(version));
+    if (schema) {
+      return std::make_pair(static_cast<uint16_t>(version), std::move(schema));
+    }
+  }
+  return arrow::Status::KeyError("schema not found");
+}
+
+arrow::Result<std::shared_ptr<arrow::RecordBatch>> AddArchiveMetadataColumns(
+    uint64_t uid, const Frame &frame,
+    const std::shared_ptr<arrow::RecordBatch> &batch) {
+  arrow::UInt64Builder uid_builder;
+  arrow::Int64Builder ts_builder;
+  arrow::UInt16Builder ver_builder;
+  for (int64_t i = 0; i < batch->num_rows(); ++i) {
+    ARROW_RETURN_NOT_OK(uid_builder.Append(uid));
+    ARROW_RETURN_NOT_OK(ts_builder.Append(frame.timestamp));
+    ARROW_RETURN_NOT_OK(ver_builder.Append(frame.schema_version));
+  }
+
+  std::shared_ptr<arrow::Array> uid_array;
+  std::shared_ptr<arrow::Array> ts_array;
+  std::shared_ptr<arrow::Array> ver_array;
+  ARROW_RETURN_NOT_OK(uid_builder.Finish(&uid_array));
+  ARROW_RETURN_NOT_OK(ts_builder.Finish(&ts_array));
+  ARROW_RETURN_NOT_OK(ver_builder.Finish(&ver_array));
+
+  std::vector<std::shared_ptr<arrow::Field>> fields = {
+      arrow::field("__uid", arrow::uint64(), false),
+      arrow::field("__timestamp", arrow::int64(), false),
+      arrow::field("__schema_version", arrow::uint16(), false),
+  };
+  std::vector<std::shared_ptr<arrow::Array>> columns = {
+      uid_array, ts_array, ver_array};
+
+  for (int i = 0; i < batch->num_columns(); ++i) {
+    fields.push_back(batch->schema()->field(i));
+    columns.push_back(batch->column(i));
+  }
+
+  return arrow::RecordBatch::Make(arrow::schema(std::move(fields)),
+                                  batch->num_rows(), std::move(columns));
 }
 
 bool IsRunningInCgroup() {
@@ -684,7 +738,91 @@ arrow::Status ArrowRocksEngine::DropTable(uint16_t table_id) {
 
 arrow::Status ArrowRocksEngine::ArchiveTable(uint16_t table_id,
                                              const std::string &archive_path) {
-  (void)archive_path;
+  if (state_ != EngineState::kReady) {
+    return arrow::Status::Invalid("engine not ready");
+  }
+  auto *cf = GetCF(table_id);
+  if (!cf) {
+    return arrow::Status::KeyError("table not found");
+  }
+
+  ARROW_ASSIGN_OR_RAISE(auto latest_schema_info,
+                        FindLatestSchemaForArchive(registry_, table_id));
+  const auto &latest_schema = latest_schema_info.second;
+
+  std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+  rocksdb::ReadOptions ro;
+  std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(ro, cf));
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    const auto key = it->key();
+    const uint64_t uid =
+        DecodeKey(std::string_view(key.data(), static_cast<std::size_t>(key.size())));
+
+    const auto value = it->value();
+    auto bytes = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t *>(value.data()),
+        static_cast<std::size_t>(value.size()));
+    std::size_t offset = 0;
+    while (offset < bytes.size()) {
+      auto header_res = DecodeFrameHeader(bytes.subspan(offset));
+      if (!header_res.ok()) {
+        break;
+      }
+      const auto frame_size = header_res->total_size();
+      if (frame_size > bytes.size() - offset) {
+        break;
+      }
+      auto frame_bytes = bytes.subspan(offset, frame_size);
+      if (!ValidateFrameCRC(frame_bytes)) {
+        Metrics::Global()->IncCRCError(1);
+        offset += frame_size;
+        continue;
+      }
+
+      ARROW_ASSIGN_OR_RAISE(auto frame, DecodeFrame(frame_bytes));
+      std::shared_ptr<arrow::RecordBatch> batch = frame.record_batch;
+      if (!batch->schema()->Equals(*latest_schema, false)) {
+        ARROW_ASSIGN_OR_RAISE(batch, ProjectToSchema(batch, latest_schema));
+      }
+      ARROW_ASSIGN_OR_RAISE(auto archive_batch,
+                            AddArchiveMetadataColumns(uid, frame, batch));
+      batches.push_back(std::move(archive_batch));
+      offset += frame_size;
+    }
+  }
+  ARROW_RETURN_NOT_OK(ToArrowStatus(it->status()));
+
+  const auto parent_dir = std::filesystem::path(archive_path).parent_path();
+  if (!parent_dir.empty()) {
+    std::error_code ec;
+    std::filesystem::create_directories(parent_dir, ec);
+    if (ec) {
+      return arrow::Status::IOError("failed to create archive dir: " + ec.message());
+    }
+  }
+
+  std::shared_ptr<arrow::Schema> archive_schema = arrow::schema({
+      arrow::field("__uid", arrow::uint64(), false),
+      arrow::field("__timestamp", arrow::int64(), false),
+      arrow::field("__schema_version", arrow::uint16(), false),
+  });
+  for (const auto &f : latest_schema->fields()) {
+    archive_schema = archive_schema->AddField(archive_schema->num_fields(), f).ValueOrDie();
+  }
+
+  std::shared_ptr<arrow::Table> table;
+  if (batches.empty()) {
+    table = arrow::Table::Make(
+        archive_schema, std::vector<std::shared_ptr<arrow::ChunkedArray>>{}, 0);
+  } else {
+    ARROW_ASSIGN_OR_RAISE(table, arrow::Table::FromRecordBatches(archive_schema, batches));
+  }
+
+  ARROW_ASSIGN_OR_RAISE(auto sink, arrow::io::FileOutputStream::Open(archive_path));
+  ARROW_RETURN_NOT_OK(parquet::arrow::WriteTable(
+      *table, arrow::default_memory_pool(), sink, std::max<int64_t>(table->num_rows(), 1)));
+  ARROW_RETURN_NOT_OK(sink->Close());
+
   return DropTable(table_id);
 }
 
