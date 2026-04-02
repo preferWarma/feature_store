@@ -1,5 +1,6 @@
 {
     "db_path": "/tmp/fs_db",
+    "disable_wal": true,
     "block_cache_size_mb": 1024,
     "ttl_days": 7,
     "enable_mmap_reads": true,

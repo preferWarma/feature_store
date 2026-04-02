@@ -210,6 +210,7 @@ arrow::Status ArrowRocksEngine::Init(const EngineConfig &config) {
   ARROW_RETURN_NOT_OK(config.Validate());
   state_ = EngineState::kNotReady;
   config_ = config;
+  write_opts_.disableWAL = config.disable_wal;
 
   rocksdb::Options options;
   options.create_if_missing = true;

@@ -50,6 +50,7 @@ TEST(EngineConfigTest, LoadFromJsonFileParsesFields) {
     const auto path = WriteTempJsonFile(R"json(
 {
   "db_path": "/tmp/db_path",
+  "disable_wal": true,
   "block_cache_size_mb": 128,
   "ttl_days": 7,
   "enable_mmap_reads": true,
@@ -65,6 +66,7 @@ TEST(EngineConfigTest, LoadFromJsonFileParsesFields) {
     ASSERT_TRUE(cfg_result.ok()) << cfg_result.status().ToString();
     const auto& cfg = cfg_result.ValueOrDie();
     EXPECT_EQ(cfg.db_path, "/tmp/db_path");
+    EXPECT_TRUE(cfg.disable_wal);
     EXPECT_EQ(cfg.block_cache_size_mb, 128U);
     EXPECT_EQ(cfg.ttl_days, 7);
     EXPECT_TRUE(cfg.enable_mmap_reads);
@@ -90,6 +92,14 @@ TEST(EngineConfigTest, LoadFromJsonFileRejectsInvalidJson) {
 TEST(EngineConfigTest, LoadFromJsonFileRejectsMissingFile) {
     auto cfg_result = EngineConfig::LoadFromJsonFile("/tmp/nonexistent_config_file.json");
     EXPECT_FALSE(cfg_result.ok());
+}
+
+TEST(EngineConfigTest, ToStringIncludesDisableWal) {
+    EngineConfig cfg;
+    cfg.db_path = "/tmp/testdb";
+    cfg.disable_wal = true;
+    const auto text = cfg.ToString();
+    EXPECT_NE(text.find("\"disable_wal\":true"), std::string::npos);
 }
 
 }  // namespace
