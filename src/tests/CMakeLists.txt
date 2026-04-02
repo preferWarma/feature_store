@@ -51,3 +51,15 @@ target_link_libraries(schema_registry_test
 )
 
 add_test(NAME schema_registry_test COMMAND schema_registry_test)
+
+add_executable(arrow_merge_operator_test
+    ${PROJECT_SOURCE_DIR}/src/tests/arrow_merge_operator_test.cc
+)
+
+target_link_libraries(arrow_merge_operator_test
+    PRIVATE
+    feature_store_engine
+    GTest::gtest_main
+)
+
+add_test(NAME arrow_merge_operator_test COMMAND arrow_merge_operator_test)

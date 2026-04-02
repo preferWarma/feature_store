@@ -23,6 +23,7 @@ endif()
 add_executable(feature_store main.cpp)
 
 add_library(feature_store_engine
+    src/engine/arrow_merge_operator.cc
     src/engine/frame_codec.cc
     src/engine/engine_config.cc
     src/engine/schema_registry.cc
