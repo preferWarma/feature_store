@@ -63,3 +63,15 @@ target_link_libraries(arrow_merge_operator_test
 )
 
 add_test(NAME arrow_merge_operator_test COMMAND arrow_merge_operator_test)
+
+add_executable(arrow_ttl_filter_test
+    ${PROJECT_SOURCE_DIR}/src/tests/arrow_ttl_filter_test.cc
+)
+
+target_link_libraries(arrow_ttl_filter_test
+    PRIVATE
+    feature_store_engine
+    GTest::gtest_main
+)
+
+add_test(NAME arrow_ttl_filter_test COMMAND arrow_ttl_filter_test)
