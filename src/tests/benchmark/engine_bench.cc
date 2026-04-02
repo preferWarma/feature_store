@@ -87,6 +87,7 @@ struct EngineBenchContext {
     EngineConfig cfg;
     cfg.db_path = TempPath(name);
     cfg.block_cache_size_mb = cache_mb;
+    cfg.disable_wal = true;
     cfg.ttl_days = 30;
     auto st = engine.Init(cfg);
     if (!st.ok()) {
